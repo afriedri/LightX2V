@@ -12,6 +12,19 @@ def enabled(name):
     return os.environ.get("RADEON_CORESW_" + name, "1") != "0"
 
 
+def norm_modulation(norm, inputs, scale, shift, indices):
+    """RMSNorm + AdaLN modulation. NORM_MODULATION=1 fuses both into one pass (1-ulp BF16 differences on ~2e-6 of outputs)."""
+    from lightx2v.common.ops.norm.rms_norm_weight import RMSWeightNative
+
+    if enabled("NORM_MODULATION") and enabled("LOSSLESS") and type(norm) is RMSWeightNative and inputs.ndim == 2 and inputs.is_contiguous():
+        weight = norm._get_actual_weight()
+        if isinstance(weight, torch.Tensor) and weight.dtype == torch.bfloat16 and inputs.dtype == torch.bfloat16:
+            from aiter.ops.gfx1201.norm_modulation import rms_modulate
+
+            return rms_modulate(inputs, weight, norm.eps, scale, shift, indices)
+    return apply_modulation(norm.apply(inputs), scale, shift, indices)
+
+
 def apply_modulation(inputs, scale, shift, indices):
     if enabled("LOSSLESS"):
         return modulate(inputs, scale, shift, indices)
@@ -104,7 +117,7 @@ def infer_block(owner, weights, hidden_states, pre_infer_out, modulation):
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
     indices = pre_infer_out.adaln_indices
     with record_function("radeon_h3.norm_modulation.attn"):
-        normed = apply_modulation(weights.norm1.apply(hidden_states), scale_msa, shift_msa, indices)
+        normed = norm_modulation(weights.norm1, hidden_states, scale_msa, shift_msa, indices)
     with record_function("radeon_h3.attention"):
         attention = norm_rope_attention(owner, weights.attn, normed, pre_infer_out)
         if attention is None:
@@ -113,14 +126,14 @@ def infer_block(owner, weights, hidden_states, pre_infer_out, modulation):
         hidden_states = project_attention(owner, weights.attn.to_out, attention, hidden_states, gate_msa, indices, workspace)
     del attention, normed
     with record_function("radeon_h3.norm_modulation.ffn"):
-        normed = apply_modulation(weights.norm2.apply(hidden_states), scale_mlp, shift_mlp, indices)
+        normed = norm_modulation(weights.norm2, hidden_states, scale_mlp, shift_mlp, indices)
     with record_function("radeon_h3.ffn_reduce_residual"):
         output = feed_forward(owner, weights.ff, normed, hidden_states, gate_mlp, indices, workspace)
     if not getattr(owner, "_radeon_active_reported", False):
         rank = os.environ.get("RANK", "0")
         print(f"========== [RADEON OP][rank={rank}][ACTIVE] TP2 fused block submitted; "
               f"device={hidden_states.device} shape={tuple(hidden_states.shape)}; "
-              f"switches={dict((name, enabled(name)) for name in ('LOSSLESS', 'ATTENTION', 'OUT_PROJECTION', 'FFN_UP', 'FFN_DOWN'))}; "
+              f"switches={dict((name, enabled(name)) for name in ('LOSSLESS', 'ATTENTION', 'OUT_PROJECTION', 'FFN_UP', 'FFN_DOWN', 'QKV_PROJECTION', 'NORM_MODULATION'))}; "
               "asynchronous submission only, confirm completion in GPU trace ==========",
               file=sys.stderr, flush=True)
         owner._radeon_active_reported = True
@@ -200,6 +213,29 @@ def prepare_qk_rope(owner, weights, query, key, value, rotary_emb):
     return query, key, value
 
 
+def _local_qkv_weight(module, group):
+    if not isinstance(module, MMWeightTP) or module.tp_size != 2 or module.tp_group is not group or module.split_dim != "col":
+        return None
+    inner = unwrap_tp_weight(module)
+    if type(inner) is not MMWeight or inner.has_lora_branch or inner.has_diff or getattr(inner, "bias", None) is not None:
+        return None
+    weight = inner._get_actual_weight()
+    if not isinstance(weight, torch.Tensor) or tuple(weight.shape) != (5376, 3584) or weight.dtype != torch.bfloat16 or weight.stride() != (1, 5376):
+        return None
+    return weight.t()
+
+
+def project_qkv(owner, weights, hidden_states):
+    """Q/K/V projections. QKV_PROJECTION=1 runs all three in one Triton launch instead of three hipBLASLt GEMMs."""
+    if enabled("QKV_PROJECTION") and hidden_states.ndim == 2 and hidden_states.dtype == torch.bfloat16 and hidden_states.is_contiguous():
+        local = [_local_qkv_weight(module, owner.tp_group) for module in (weights.to_q, weights.to_k, weights.to_v)]
+        if all(weight is not None for weight in local):
+            from aiter.ops.gfx1201.qkv_projection import qkv_projection
+
+            return qkv_projection(hidden_states, *local)
+    return weights.to_q.apply(hidden_states), weights.to_k.apply(hidden_states), weights.to_v.apply(hidden_states)
+
+
 def norm_rope_attention(owner, weights, hidden_states, pre_infer_out):
     """Projected QKV -> fused QK norm/RoPE/Sage quant -> attention core; None selects the unfused path."""
     if not enabled("LOSSLESS") or not owner.config.get("radeon_gfx1201_qk_norm_rope", owner.config.get("radeon_gfx1201_h3", False)):
@@ -214,9 +250,7 @@ def norm_rope_attention(owner, weights, hidden_states, pre_infer_out):
                   "requires gfx1201_sage_attn, no SP and separate Q/K/V projections", file=sys.stderr, flush=True)
             owner._radeon_fused_qk_fallback = True
         return None
-    query = weights.to_q.apply(hidden_states)
-    key = weights.to_k.apply(hidden_states)
-    value = weights.to_v.apply(hidden_states)
+    query, key, value = project_qkv(owner, weights, hidden_states)
     inputs = _qk_rope_inputs(owner, weights, query, key, value, pre_infer_out.rotary_emb)
     if inputs is None:
         return None
