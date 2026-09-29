@@ -34,6 +34,7 @@ from __future__ import annotations
 import gc
 import json
 import math
+import os
 from pathlib import Path
 from typing import NamedTuple
 
@@ -859,6 +860,11 @@ class MiniMaxH3VideoVAE(nn.Module):
         if use_compile:
             logger.info("[Compile] Using torch.compile for MiniMaxH3VideoEncoder3d")
             model.encoder = torch.compile(model.encoder, dynamic=None)
+        elif os.environ.get("LIGHTX2V_H3_VAE_FUSED", "1") != "0" and torch.cuda.is_available():
+            from lightx2v.models.video_encoders.hf.minimax_h3.fused_vit_ops import patch_block
+
+            patched = sum(patch_block(block) for block in model.decoder.transformer_blocks)
+            logger.info(f"MiniMax-H3 Video VAE: fused Triton norm/RoPE/residual/SwiGLU ops on {patched}/{len(model.decoder.transformer_blocks)} decoder blocks")
         return model
 
     def set_decode_tile_shape(self, tile_height: int, tile_width: int) -> None:
