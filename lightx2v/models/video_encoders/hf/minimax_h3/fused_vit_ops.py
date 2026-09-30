@@ -30,17 +30,20 @@ def _rms_rows(x, w, out, cols: tl.constexpr, eps, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _qk_norm_rope(q, k, cos, sin, qo, ko, heads: tl.constexpr, eps, ROT: tl.constexpr, HEADS_PER: tl.constexpr):
+def _qk_norm_rope(q, k, cos, sin, qo, ko, heads: tl.constexpr, eps, ROT: tl.constexpr, HEADS_PER: tl.constexpr,
+                  TOKENS):
     # one program = HEADS_PER heads of one token, for q and k. D = 64, rotary dim ROT (48), cos/sin [T, ROT] fp32
+    # (shared by every batch item: token index modulo TOKENS)
     tok = tl.program_id(0)
+    pos = tok % TOKENS
     hb = tl.program_id(1)
     d = tl.arange(0, 64)
     h = hb * HEADS_PER + tl.arange(0, HEADS_PER)
     base = tok * heads * 64 + h[:, None] * 64 + d[None, :]
     half: tl.constexpr = ROT // 2
     rot_mask = d < ROT
-    c = tl.load(cos + tok * ROT + d, rot_mask, other=0.0).to(tl.float16).to(tl.float32)
-    s = tl.load(sin + tok * ROT + d, rot_mask, other=0.0).to(tl.float16).to(tl.float32)
+    c = tl.load(cos + pos * ROT + d, rot_mask, other=0.0).to(tl.float16).to(tl.float32)
+    s = tl.load(sin + pos * ROT + d, rot_mask, other=0.0).to(tl.float16).to(tl.float32)
     partner = tl.where(d < half, d + half, d - half)
     sign = tl.where(d < half, -1.0, 1.0)
     for which in tl.static_range(2):
@@ -92,14 +95,15 @@ def rms_to_half(x, weight, eps):
 
 
 def qk_norm_rope(q, k, cos, sin, eps):
-    # q,k: [1,T,H,64] fp16 (views of contiguous [1,T,H*64]); cos/sin: [1,T,1,ROT] fp32
+    # q,k: [B,T,H,64] fp16 (views of [B,T,H*64]); cos/sin: [1 or B,T,1,ROT] fp32, identical for every batch item
     B, T, H, Dh = q.shape
     q = q.contiguous(); k = k.contiguous()
     qo = torch.empty_like(q); ko = torch.empty_like(k)
     rot = cos.shape[-1]
-    c = cos.reshape(T, rot).contiguous(); s = sin.reshape(T, rot).contiguous()
+    c = cos[:1].reshape(T, rot).contiguous(); s = sin[:1].reshape(T, rot).contiguous()
     HP = 8
-    _qk_norm_rope[(B * T, H // HP)](q, k, c, s, qo, ko, H, eps, ROT=rot, HEADS_PER=HP, num_warps=2, enable_fp_fusion=False)
+    _qk_norm_rope[(B * T, H // HP)](q, k, c, s, qo, ko, H, eps, ROT=rot, HEADS_PER=HP, TOKENS=T, num_warps=2,
+                                    enable_fp_fusion=False)
     return qo, ko
 
 
@@ -118,10 +122,31 @@ def swiglu(p):
     return out
 
 
+def _linear(module, x):
+    """nn.Linear, or the FP8 W8A8 path when the module carries ``_fp8`` (per-channel E4M3 weight, per-token act)."""
+    fp8 = getattr(module, "_fp8", None)
+    if fp8 is None:
+        return module(x)
+    from aiter.ops.gfx1201 import fp8_gemm
+    x2 = x.reshape(-1, x.shape[-1])
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    x8, xs = fp8_gemm.quant_rows(x2)
+    weight8, weight_scales, bias = fp8
+    out = torch.empty((x2.shape[0], weight8.shape[0]), device=x.device, dtype=x.dtype)
+    fp8_gemm.mm8_out(x8, xs, weight8, weight_scales, out, bias=bias)
+    return out.view(*x.shape[:-1], weight8.shape[0])
+
+
 def _attn_forward(self, hidden_states, rotary_emb=None):
-    query = self.to_q(hidden_states)
-    key = self.to_k(hidden_states)
-    value = self.to_v(hidden_states)
+    packed = getattr(self, "_packed_qkv", None)
+    if packed is not None:
+        qkv = _linear(packed, hidden_states)
+        query, key, value = qkv.split(self.inner_dim, dim=-1)
+    else:
+        query = _linear(self.to_q, hidden_states)
+        key = _linear(self.to_k, hidden_states)
+        value = _linear(self.to_v, hidden_states)
     query = query.unflatten(2, (self.heads, self.dim_head))
     key = key.unflatten(2, (self.heads, self.dim_head))
     value = value.unflatten(2, (self.heads, self.dim_head))
@@ -129,7 +154,7 @@ def _attn_forward(self, hidden_states, rotary_emb=None):
     query, key = qk_norm_rope(query, key, cos, sin, self.norm_q.eps)
     hidden_states = self.calculate.apply(query, key, value, max_seqlen_q=query.shape[1],
                                          max_seqlen_kv=key.shape[1]).view(query.shape[0], query.shape[1], self.inner_dim)
-    return self.to_out[0](hidden_states)
+    return _linear(self.to_out[0], hidden_states)
 
 
 def _block_forward(self, hidden_states, rotary_emb=None):
@@ -138,7 +163,7 @@ def _block_forward(self, hidden_states, rotary_emb=None):
     hidden_states = gated_add(hidden_states, a, self.scale1)
     n = rms_to_half(hidden_states, self.norm2.weight, self.norm2.eps)
     ff = self.ff.net
-    y = ff[2](swiglu(ff[0].proj(n)))
+    y = _linear(ff[2], swiglu(_linear(ff[0].proj, n)))
     return gated_add(hidden_states, y, self.scale2)
 
 
@@ -149,9 +174,51 @@ def eligible(block):
             and block.norm1.weight.dtype == torch.float32 and a.norm_q.weight is None)
 
 
-def patch_block(block):
+def _pack_qkv(attn):
+    """One [3*inner, dim] Linear whose weight/bias storage the original to_q/to_k/to_v parameters view (no extra memory)."""
+    linears = (attn.to_q, attn.to_k, attn.to_v)
+    weight = torch.cat([linear.weight.data for linear in linears], dim=0)
+    bias = torch.cat([linear.bias.data for linear in linears], dim=0) if linears[0].bias is not None else None
+    packed = torch.nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None, device="meta", dtype=weight.dtype)
+    packed.weight = torch.nn.Parameter(weight, requires_grad=False)
+    if bias is not None:
+        packed.bias = torch.nn.Parameter(bias, requires_grad=False)
+    rows = attn.inner_dim
+    for index, linear in enumerate(linears):
+        linear.weight = torch.nn.Parameter(weight[index * rows:(index + 1) * rows], requires_grad=False)
+        if bias is not None:
+            linear.bias = torch.nn.Parameter(bias[index * rows:(index + 1) * rows], requires_grad=False)
+    attn._packed_qkv = packed
+
+
+def _quantize_linear(linear):
+    """Attach per-output-channel E4M3 weights (quantized on the weight's device) for the FP8 decode path."""
+    from aiter.ops.gfx1201 import fp8_gemm
+    weight = linear.weight.data
+    if weight.device.type != "cuda":
+        return False
+    weight8, scales = fp8_gemm.quant_rows(weight.contiguous())
+    linear._fp8 = (weight8, scales, linear.bias.data.contiguous() if linear.bias is not None else None)
+    return True
+
+
+def _release_weight(linear):
+    # The FP8 path never reads the FP16 weight again; free it (the VAE stays resident during the DiT).
+    linear.weight = torch.nn.Parameter(torch.empty(0, device=linear.weight.device, dtype=linear.weight.dtype),
+                                       requires_grad=False)
+
+
+def patch_block(block, fp8=False):
+    """fp8=True (LIGHTX2V_H3_VAE_FP8=1): Q/K/V (packed), attention-out and FFN Linears run as FP8 W8A8
+    (per-output-channel E4M3 weights, per-token E4M3 activations); the FP16 weights are released."""
     if not eligible(block):
         return False
+    if fp8:
+        _pack_qkv(block.attn)
+        linears = [block.attn._packed_qkv, block.attn.to_out[0], block.ff.net[0].proj, block.ff.net[2]]
+        if all(_quantize_linear(linear) for linear in linears):
+            for linear in linears + [block.attn.to_q, block.attn.to_k, block.attn.to_v]:
+                _release_weight(linear)
     block.attn.forward = types.MethodType(_attn_forward, block.attn)
     block.forward = types.MethodType(_block_forward, block)
     return True
