@@ -12,6 +12,21 @@ def enabled(name):
     return os.environ.get("RADEON_CORESW_" + name, "1") != "0"
 
 
+def fused_tail_enabled():
+    """RADEON_CORESW_FUSED_TAIL=1 (default 0): row-chunked out-projection -> norm2+modulation -> FFN with the IPC pull
+    reducer (aiter H3TP2Workspace(reducer="pull").fused_tail); bitwise equal to the unfused path. Used only on the
+    lossless BF16 path (LOSSLESS, OUT_PROJECTION, FFN_UP, FFN_DOWN on; RADEON_CORESW_FP8 off)."""
+    if os.environ.get("RADEON_CORESW_FUSED_TAIL", "0") in ("", "0"):
+        return False
+    if os.environ.get("RADEON_CORESW_FP8", "0").strip().lower() not in ("", "0", "none", "off"):
+        return False
+    return all(enabled(name) for name in ("LOSSLESS", "OUT_PROJECTION", "FFN_UP", "FFN_DOWN"))
+
+
+def tail_chunk():
+    return int(os.environ.get("RADEON_CORESW_TAIL_CHUNK", "8192"))
+
+
 _FP8_STEP_OFF = False
 
 
@@ -232,10 +247,12 @@ def _infer_block(owner, weights, hidden_states, pre_infer_out, modulation):
     if hidden_states.dtype != torch.bfloat16 or owner.hidden_size != 5376 or owner.num_heads != 28 or owner.head_dim != 128:
         raise ValueError("Radeon H3 block fusion requires BF16 H3 TP2 geometry")
     workspace = None
+    fused_tail = fused_tail_enabled()
     if enabled("LOSSLESS") and (enabled("OUT_PROJECTION") or (enabled("FFN_UP") and enabled("FFN_DOWN"))):
         workspace = getattr(owner, "_radeon_workspace", None)
         if workspace is None:
-            workspace = H3TP2Workspace(hidden_states.shape[0], hidden_states.device, owner.tp_group)
+            workspace = H3TP2Workspace(hidden_states.shape[0], hidden_states.device, owner.tp_group,
+                                       reducer="pull" if fused_tail else "fused")
             owner._radeon_workspace = workspace
         if workspace.rows != hidden_states.shape[0] or workspace.device != hidden_states.device:
             raise ValueError("Radeon H3 workspace shape/device changed; recreate the infer instance")
@@ -249,6 +266,27 @@ def _infer_block(owner, weights, hidden_states, pre_infer_out, modulation):
             raise ValueError("RADEON_CORESW_FP8=qkv requires the fused norm/RoPE/Sage attention path")
         if attention is None:
             attention = owner._attention(weights.attn, normed, pre_infer_out, project_output=False)
+    if fused_tail and workspace is not None and workspace.reducer == "pull":
+        out_weight = local_weight(weights.attn.to_out, owner.tp_group, "row", (3584, 5376))
+        up_weight = local_weight(weights.ff.in_proj, owner.tp_group, "col", (5376, 14336)).t()
+        down_weight = local_weight(weights.ff.out_proj, owner.tp_group, "row", (7168, 5376))
+        del normed
+
+        def modulate_rows(rows, row_indices):
+            return norm_modulation(weights.norm2, rows, scale_mlp, shift_mlp, row_indices)
+
+        chunk = tail_chunk()
+        with record_function("radeon_h3.fused_tail"):
+            output = workspace.fused_tail(attention, hidden_states, out_weight, up_weight, down_weight, gate_msa,
+                                          gate_mlp, indices, modulate_rows, chunk=chunk)
+        del attention
+        if not getattr(owner, "_radeon_fused_tail_reported", False):
+            print(f"========== [RADEON OP][rank={os.environ.get('RANK', '0')}][ACTIVE] FUSED_TAIL reducer=pull "
+                  f"chunks={len(workspace.tail_chunks(chunk))}x<={chunk} norm_modulation="
+                  f"{'fused' if enabled('NORM_MODULATION') else 'separate'} ==========", file=sys.stderr, flush=True)
+            owner._radeon_fused_tail_reported = True
+        _report_active(owner, hidden_states)
+        return output
     with record_function("radeon_h3.out_projection_reduce_residual"):
         hidden_states = project_attention(owner, weights.attn.to_out, attention, hidden_states, gate_msa, indices, workspace)
     del attention, normed
@@ -257,16 +295,22 @@ def _infer_block(owner, weights, hidden_states, pre_infer_out, modulation):
                                  fp8=fp8_enabled("ffn") and workspace is not None)
     with record_function("radeon_h3.ffn_reduce_residual"):
         output = feed_forward(owner, weights.ff, normed, hidden_states, gate_mlp, indices, workspace)
+    _report_active(owner, hidden_states)
+    return output
+
+
+def _report_active(owner, hidden_states):
     if not getattr(owner, "_radeon_active_reported", False):
         rank = os.environ.get("RANK", "0")
+        workspace = getattr(owner, "_radeon_workspace", None)
         print(f"========== [RADEON OP][rank={rank}][ACTIVE] TP2 fused block submitted; "
               f"device={hidden_states.device} shape={tuple(hidden_states.shape)}; "
               f"switches={dict((name, enabled(name)) for name in ('LOSSLESS', 'ATTENTION', 'OUT_PROJECTION', 'FFN_UP', 'FFN_DOWN', 'QKV_PROJECTION', 'NORM_MODULATION'))}; "
               f"fp8={[part for part in ('qkv', 'out', 'ffn') if fp8_enabled(part)]}; "
+              f"fused_tail={fused_tail_enabled()} reducer={getattr(workspace, 'reducer', None)}; "
               "asynchronous submission only, confirm completion in GPU trace ==========",
               file=sys.stderr, flush=True)
         owner._radeon_active_reported = True
-    return output
 
 
 def _qk_rope_inputs(owner, weights, query, key, value, rotary_emb):
