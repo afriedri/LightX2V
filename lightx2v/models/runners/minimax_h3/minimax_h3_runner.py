@@ -50,6 +50,26 @@ from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4D
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
 
+class _PeerAudio:
+    """Audio decoded on another rank: ``waveform`` receives it (first access) as the CPU [2, samples] tensor."""
+
+    def __init__(self, source):
+        self.source = source
+        self.sampling_rate = None
+        self._waveform = None
+
+    @property
+    def waveform(self):
+        if self._waveform is None:
+            header = torch.zeros(4, dtype=torch.int64, device=AI_DEVICE)
+            dist.recv(header, src=self.source)
+            shape = tuple(int(value) for value in header.tolist() if value > 0)
+            waveform = torch.empty(shape, dtype=torch.float32, device=AI_DEVICE)
+            dist.recv(waveform, src=self.source)
+            self._waveform = waveform[0].cpu()
+        return self._waveform
+
+
 torch_device_module = getattr(torch, AI_DEVICE)
 
 
@@ -120,10 +140,26 @@ class MiniMaxH3Runner(DefaultRunner):
     def init_modules(self):
         super().init_modules()
         self.run_input_encoder = self._run_input_encoder_local_h3
+        if self.model is not None:
+            self._finish_model_setup()
+
+    def _finish_model_setup(self):
         if self.model.prepost_resident:
             self.model.pre_weight.to_cuda()
             self.model.post_weight.to_cuda()
             logger.info("MiniMax-H3 pre/post weights will remain on the accelerator across requests")
+
+    def _ensure_model(self):
+        """Join the background DiT load (LIGHTX2V_H3_ASYNC_DIT_LOAD) before the first DiT use."""
+        future = getattr(self, "_model_future", None)
+        if future is None:
+            return
+        with ProfilingContext4DebugL2("Wait for DiT load"):
+            self.model = future.result()
+        self._model_future = None
+        self._model_executor.shutdown(wait=False)
+        self.model.set_scheduler(self.scheduler)
+        self._finish_model_setup()
 
     @ProfilingContext4DebugL1("Warmup")
     def run_warmup(self):
@@ -205,7 +241,23 @@ class MiniMaxH3Runner(DefaultRunner):
 
     @ProfilingContext4DebugL2("Load models")
     def load_model(self):
-        self.model = self.load_transformer()
+        # LIGHTX2V_H3_ASYNC_DIT_LOAD=1: read/shard/pin the DiT checkpoint on a worker thread while this thread loads
+        # the text encoder and VAEs and runs the input encoders (the DiT is first needed in init_run). The load
+        # itself issues no collectives; the worker binds the same device.
+        if os.environ.get("LIGHTX2V_H3_ASYNC_DIT_LOAD", "1") != "0" and torch.cuda.is_available():
+            from concurrent.futures import ThreadPoolExecutor
+
+            device = torch.cuda.current_device()
+
+            def load():
+                torch.cuda.set_device(device)
+                return self.load_transformer()
+
+            self._model_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-dit-load")
+            self._model_future = self._model_executor.submit(load)
+            self.model = None
+        else:
+            self.model = self.load_transformer()
         self.text_encoders = self.load_text_encoder()
         self.video_vae, self.audio_vae = self.load_vae()
 
@@ -527,6 +579,9 @@ class MiniMaxH3Runner(DefaultRunner):
                     metrics_labels=["MiniMaxH3Runner"],
                 ):
                     self.condition_video_latents = self._encode_keyframes(keyframes)
+        dump = os.environ.get("LIGHTX2V_H3_DUMP_TEXT")
+        if dump and (not dist.is_initialized() or dist.get_rank() == 0):
+            torch.save({key: value.detach().cpu() for key, value in text_encoder_output.items() if isinstance(value, torch.Tensor)}, dump)
         tags = text_encoder_output["text_token_tags"]
         if tags.ndim != 1:
             raise ValueError("MiniMax-H3 conditioner token tags must be one-dimensional")
@@ -540,6 +595,7 @@ class MiniMaxH3Runner(DefaultRunner):
 
     @ProfilingContext4DebugL2("Prepare DiT")
     def init_run(self):
+        self._ensure_model()
         prompt_embeds = self.inputs["text_encoder_output"]["prompt_embeds"]
         self.scheduler.prepare(
             seed=self.input_info.seed,
@@ -654,13 +710,40 @@ class MiniMaxH3Runner(DefaultRunner):
             self.video_vae.set_decode_tile_shape(*tile_shape)
             logger.info(f"MiniMax-H3 Video VAE decode tile shape for {resolution}: {tile_shape[0]}x{tile_shape[1]}")
 
+        dump = os.environ.get("LIGHTX2V_H3_DUMP_LATENTS")
+        if dump and (not dist.is_initialized() or dist.get_rank() == 0):
+            torch.save({"video": video_latents.detach().cpu(), "audio": audio_latents.detach().cpu()}, dump)
         with ProfilingContext4DebugL1("Run Video VAE Decoder"):
             video = self.video_vae.decode(video_latents)
         audio = None
-        if not self.video_vae.decode_parallel or dist.get_rank() == 0:
+        peer = self._audio_peer_rank()
+        if peer is None:
+            if not self.video_vae.decode_parallel or dist.get_rank() == 0:
+                with ProfilingContext4DebugL1("Run Audio VAE Decoder"):
+                    audio = self.audio_vae.decode(audio_latents)
+        elif dist.get_rank() == peer:
+            # The last rank is idle once its video tiles are sent: decode the audio there and ship the
+            # waveform to rank 0, which only needs it after muxing every video frame (encode_video).
             with ProfilingContext4DebugL1("Run Audio VAE Decoder"):
-                audio = self.audio_vae.decode(audio_latents)
+                waveform = self.audio_vae.decode(audio_latents).float().contiguous()
+                if waveform.device.type == "cpu":
+                    waveform = waveform.to(AI_DEVICE)
+                header = torch.zeros(4, dtype=torch.int64, device=waveform.device)
+                header[: waveform.ndim] = torch.tensor(waveform.shape, dtype=torch.int64)
+                dist.send(header, dst=0)
+                dist.send(waveform, dst=0)
+                torch_device_module.synchronize()
+        elif dist.get_rank() == 0:
+            audio = _PeerAudio(peer)
         return video, audio
+
+    def _audio_peer_rank(self):
+        """LIGHTX2V_H3_AUDIO_PEER=1 (default): decode audio on the last rank, overlapped with rank 0's video save."""
+        if os.environ.get("LIGHTX2V_H3_AUDIO_PEER", "1") == "0" or self.input_info.return_result_tensor:
+            return None
+        if not self.video_vae.decode_parallel or not dist.is_initialized() or dist.get_world_size() < 2:
+            return None
+        return dist.get_world_size() - 1
 
     @staticmethod
     def _video_to_uint8_frames(video):
@@ -687,11 +770,15 @@ class MiniMaxH3Runner(DefaultRunner):
             parent = os.path.dirname(os.path.abspath(output_path))
             os.makedirs(parent, exist_ok=True)
             frames = self._video_to_uint8_frames(self.gen_video)
-            waveform = self.gen_audio[0].float().cpu()
-            audio = Audio(
-                waveform=waveform,
-                sampling_rate=self.audio_vae.sampling_rate,
-            )
+            if isinstance(self.gen_audio, _PeerAudio):
+                audio = self.gen_audio
+                audio.sampling_rate = self.audio_vae.sampling_rate
+            else:
+                waveform = self.gen_audio[0].float().cpu()
+                audio = Audio(
+                    waveform=waveform,
+                    sampling_rate=self.audio_vae.sampling_rate,
+                )
             logger.info(f"Saving MiniMax-H3 audio-video output to {output_path}")
             with ProfilingContext4DebugL2("Save Audio-Video Output"):
                 encode_video(
