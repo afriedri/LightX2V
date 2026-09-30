@@ -863,8 +863,10 @@ class MiniMaxH3VideoVAE(nn.Module):
         elif os.environ.get("LIGHTX2V_H3_VAE_FUSED", "1") != "0" and torch.cuda.is_available():
             from lightx2v.models.video_encoders.hf.minimax_h3.fused_vit_ops import patch_block
 
-            patched = sum(patch_block(block) for block in model.decoder.transformer_blocks)
-            logger.info(f"MiniMax-H3 Video VAE: fused Triton norm/RoPE/residual/SwiGLU ops on {patched}/{len(model.decoder.transformer_blocks)} decoder blocks")
+            fp8 = os.environ.get("LIGHTX2V_H3_VAE_FP8", "0") != "0" and not cpu_offload
+            patched = sum(patch_block(block, fp8=fp8) for block in model.decoder.transformer_blocks)
+            logger.info(f"MiniMax-H3 Video VAE: fused Triton norm/RoPE/residual/SwiGLU ops on {patched}/{len(model.decoder.transformer_blocks)} decoder blocks"
+                        f" (fp8_linears={fp8})")
         return model
 
     def set_decode_tile_shape(self, tile_height: int, tile_width: int) -> None:
@@ -1147,7 +1149,12 @@ class MiniMaxH3VideoVAE(nn.Module):
             pixels = self.preprocess(pixels.to(device=device, dtype=self.sensitive_layer_dtype))
             if self._use_channels_last_encoder_input:
                 pixels = pixels.contiguous(memory_format=torch.channels_last_3d)
-            with torch.no_grad():
+            # The ROCm platform disables cuDNN/MIOpen globally (faster VAE decode convolutions); the encoder's
+            # Conv3d stack then runs through slow_conv_dilated3d, which issues ~0.4M tiny copy kernels per
+            # image (launch-bound, ~3 s/image and very sensitive to host load). MIOpen runs it in ~0.9 s/image.
+            use_miopen = os.environ.get("LIGHTX2V_H3_VAE_ENCODE_MIOPEN", "1") != "0" and pixels.is_cuda
+            with torch.no_grad(), torch.backends.cudnn.flags(enabled=use_miopen or torch.backends.cudnn.enabled,
+                                                             benchmark=False, deterministic=False, allow_tf32=False):
                 if self.encode_parallel:
                     latents = self._encode_parallel(pixels, video)
                 else:
