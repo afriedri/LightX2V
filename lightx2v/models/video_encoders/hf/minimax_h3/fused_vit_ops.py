@@ -10,6 +10,7 @@ The residual/gate and SwiGLU kernels are bitwise equal to eager; the RMS statist
 different order than torch's kernel (block output rel. error ~1.5e-6; decoded 8-bit video differs by at most 1 level).
 Disable with LIGHTX2V_H3_VAE_FUSED=0.
 """
+import os
 import types
 import torch
 import torch.nn.functional as F
@@ -114,10 +115,11 @@ def gated_add(h, o, scale):
     return out
 
 
-def swiglu(p):
+def swiglu(p, out=None):
     inner = p.shape[-1] // 2
     rows = p.numel() // p.shape[-1]
-    out = torch.empty(p.shape[:-1] + (inner,), device=p.device, dtype=p.dtype)
+    if out is None:
+        out = torch.empty(p.shape[:-1] + (inner,), device=p.device, dtype=p.dtype)
     _swiglu[(triton.cdiv(rows * inner, 2048),)](p, out, rows, inner, BLOCK=2048, num_warps=8, enable_fp_fusion=False)
     return out
 
@@ -152,9 +154,30 @@ def _attn_forward(self, hidden_states, rotary_emb=None):
     value = value.unflatten(2, (self.heads, self.dim_head))
     cos, sin = rotary_emb
     query, key = qk_norm_rope(query, key, cos, sin, self.norm_q.eps)
-    hidden_states = self.calculate.apply(query, key, value, max_seqlen_q=query.shape[1],
-                                         max_seqlen_kv=key.shape[1]).view(query.shape[0], query.shape[1], self.inner_dim)
+    if _TRITON_ATTN and value.dtype == torch.float16 and self.dim_head == 64:
+        from lightx2v.models.video_encoders.hf.minimax_h3.triton_attn import flash_attn_bthd
+        hidden_states = flash_attn_bthd(query, key, value)
+    else:
+        hidden_states = self.calculate.apply(query, key, value, max_seqlen_q=query.shape[1],
+                                             max_seqlen_kv=key.shape[1]).view(query.shape[0], query.shape[1], self.inner_dim)
     return _linear(self.to_out[0], hidden_states)
+
+
+# LIGHTX2V_H3_VAE_TRITON_ATTN=1: Triton flash attention (triton_attn.py) instead of torch SDPA (rounding-level).
+_TRITON_ATTN = os.environ.get("LIGHTX2V_H3_VAE_TRITON_ATTN", "0") != "0"
+# With several decoder tiles batched along dim 0 (LIGHTX2V_H3_VAE_DEC_BATCH), hipBLASLt picks a different
+# (non-bitwise) kernel for the FFN-up GEMM (N=16384) at M>1797, while the N=2048 GEMMs stay bitwise. Run FFN-up per
+# tile so batched decoding is bitwise identical to per-tile decoding; LIGHTX2V_H3_VAE_DEC_BATCH_FFNUP=1 batches it too.
+_BATCH_FFN_UP = os.environ.get("LIGHTX2V_H3_VAE_DEC_BATCH_FFNUP", "0") != "0"
+
+
+def _ffn_up_swiglu(linear, x):
+    if x.dim() != 3 or x.shape[0] == 1 or _BATCH_FFN_UP or getattr(linear, "_fp8", None) is not None:
+        return swiglu(_linear(linear, x))
+    out = torch.empty(x.shape[:-1] + (linear.weight.shape[0] // 2,), device=x.device, dtype=x.dtype)
+    for i in range(x.shape[0]):
+        swiglu(linear(x[i:i + 1]), out=out[i:i + 1])
+    return out
 
 
 def _block_forward(self, hidden_states, rotary_emb=None):
@@ -163,7 +186,7 @@ def _block_forward(self, hidden_states, rotary_emb=None):
     hidden_states = gated_add(hidden_states, a, self.scale1)
     n = rms_to_half(hidden_states, self.norm2.weight, self.norm2.eps)
     ff = self.ff.net
-    y = _linear(ff[2], swiglu(_linear(ff[0].proj, n)))
+    y = _linear(ff[2], _ffn_up_swiglu(ff[0].proj, n))
     return gated_add(hidden_states, y, self.scale2)
 
 
