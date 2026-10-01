@@ -568,10 +568,15 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
             hidden_states = self._inject_vision_embeds(hidden_states, vision_mask, vision_embeds)
             position_embeddings = self._position_embeddings(hidden_states, position_ids)
 
+            # LIGHTX2V_H3_TE_PREFETCH_LATE=1: enqueue layer i's compute before issuing layer i+1's H2D copy.
+            # Copies from pageable host memory block the issuing thread until they finish, so with the
+            # default order the GPU idles during each copy; issuing the copy after the compute overlaps them.
+            # Same kernels on the same data in the same stream order: bitwise identical output.
+            prefetch_late = os.environ.get("LIGHTX2V_H3_TE_PREFETCH_LATE", "0") != "0"
             for layer_index in range(self.num_layers):
                 slot_index = layer_index % 2
                 manager.wait_ready(slot_index, caller_stream)
-                if layer_index + 1 < self.num_layers:
+                if not prefetch_late and layer_index + 1 < self.num_layers:
                     manager.prefetch_to_slot((slot_index + 1) % 2, layer_index + 1, self.layers)
 
                 # Keep all Qwen math on the caller's stream for numerical and
@@ -581,6 +586,8 @@ class _Qwen3VLTextBackboneWeights(WeightModule):
                 hidden_states = manager.cuda_buffers[slot_index].forward(hidden_states, position_embeddings)
                 hidden_states = self._inject_deepstack(hidden_states, layer_index, vision_mask, deepstack_embeds)
                 manager.record_free(slot_index, caller_stream)
+                if prefetch_late and layer_index + 1 < self.num_layers:
+                    manager.prefetch_to_slot((slot_index + 1) % 2, layer_index + 1, self.layers)
 
             completion_event = torch_device_module.Event()
             completion_event.record(caller_stream)
