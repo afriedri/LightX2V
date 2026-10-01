@@ -66,6 +66,10 @@ _ASYNC_VAE_LOAD = os.environ.get("LIGHTX2V_H3_ASYNC_VAE_LOAD", "0") != "0"
 # image tile through the VAE encoder with MIOpen convs on that worker thread, absorbing the ~1.5 s one-time MIOpen
 # set-up of the first encode_condition() while the text encoder runs. Encode results are bitwise unchanged.
 _VAE_ENC_PREWARM = os.environ.get("LIGHTX2V_H3_VAE_ENC_PREWARM", "0") != "0"
+# LIGHTX2V_H3_DIT_PIN_SLAB=1 (default 0): allocate the DiT's pinned host (offload) weights from a few large pageable
+# chunks that are page-locked once at the end of the load (common/ops/utils.py PinSlab) instead of one
+# power-of-two-rounded hipHostMalloc per tensor. Same bytes; faster load, less contention with the text encoder.
+_DIT_PIN_SLAB = os.environ.get("LIGHTX2V_H3_DIT_PIN_SLAB", "0") != "0"
 _gc_time = {"start": 0.0, "total": 0.0, "count": 0, "full": 0, "full_time": 0.0}
 
 
@@ -290,6 +294,14 @@ class MiniMaxH3Runner(DefaultRunner):
     def init_scheduler(self):
         self.scheduler = MiniMaxH3Scheduler(self.config)
 
+    def _load_transformer_pinned(self):
+        if not _DIT_PIN_SLAB:
+            return self.load_transformer()
+        from lightx2v.common.ops.utils import pin_slab_scope
+
+        with pin_slab_scope():
+            return self.load_transformer()
+
     @ProfilingContext4DebugL2("Load models")
     def load_model(self):
         # LIGHTX2V_H3_ASYNC_DIT_LOAD=1: read/shard/pin the DiT checkpoint on a worker thread while this thread loads
@@ -302,13 +314,13 @@ class MiniMaxH3Runner(DefaultRunner):
 
             def load():
                 torch.cuda.set_device(device)
-                return self.load_transformer()
+                return self._load_transformer_pinned()
 
             self._model_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-dit-load")
             self._model_future = self._model_executor.submit(load)
             self.model = None
         else:
-            self.model = self.load_transformer()
+            self.model = self._load_transformer_pinned()
         self.text_encoders = self.load_text_encoder()
         if _ASYNC_VAE_LOAD and torch.cuda.is_available():
             # LIGHTX2V_H3_ASYNC_VAE_LOAD=1: read the video/audio VAE checkpoints on a worker thread while this thread
