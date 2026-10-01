@@ -26,6 +26,7 @@ from __future__ import annotations
 import gc
 import json
 import math
+import os
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -39,6 +40,10 @@ from lightx2v.models.video_encoders.hf.minimax_h3.weights import (
     load_safetensors_subset,
 )
 from lightx2v_platform.base.global_var import AI_DEVICE
+
+# Opt-in: polyphase depthwise conv1d instead of the grouped conv_transpose1d in the
+# anti-aliased activations' upsampler (FP32, ulp-level summation-order differences).
+_AUDIO_POLY_UPSAMPLE = os.environ.get("LIGHTX2V_H3_AUDIO_POLY_UPSAMPLE", "0") == "1"
 
 
 def _empty_device_cache(device: torch.device) -> None:
@@ -235,9 +240,33 @@ class MiniMaxH3AudioUpSample1d(nn.Module):
             kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=kernel_size),
         )
 
+    def _poly_weight(self, num_channels: int, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Phase r of the stride-`ratio` transposed conv is a plain correlation with the
+        # reversed sub-filter f[r], f[r+ratio], ...; the `ratio *` gain (a power of two
+        # here) is folded into the taps.  Layout [C*ratio, 1, taps] = channel multiplier.
+        key = (num_channels, hidden_states.device, hidden_states.dtype)
+        cached = getattr(self, "_poly_cache", None)
+        if cached is None or cached[0] != key:
+            filt = self.filter.reshape(-1).to(device=hidden_states.device, dtype=hidden_states.dtype)
+            taps = filt.numel() // self.ratio
+            phases = torch.stack([filt[r :: self.ratio].flip(0) for r in range(self.ratio)])  # [ratio, taps]
+            weight = (self.ratio * phases).unsqueeze(1).repeat(num_channels, 1, 1).contiguous()  # [C*ratio, 1, taps]
+            self._poly_cache = cached = (key, weight, taps)
+        return cached[1], cached[2]
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_channels = hidden_states.shape[1]
         hidden_states = F.pad(hidden_states, (self.pad, self.pad), mode="replicate")
+        if _AUDIO_POLY_UPSAMPLE and self.filter.shape[-1] % self.ratio == 0:
+            # Polyphase form of the depthwise transposed conv below (same products, FP32
+            # summation order may differ at the ulp level).  The grouped conv_transpose1d
+            # runs as one GEMM + col2im per channel (slow_conv_transpose2d loop: ~18k
+            # launches per audio decode); this is one depthwise conv1d per call.
+            weight, taps = self._poly_weight(num_channels, hidden_states)
+            batch, _, length = hidden_states.shape
+            out = F.conv1d(F.pad(hidden_states, (taps - 1, taps - 1)), weight, groups=num_channels)
+            out = out.view(batch, num_channels, self.ratio, length + taps - 1).transpose(2, 3).reshape(batch, num_channels, -1)
+            return out[..., self.pad_left : -self.pad_right]
         hidden_states = self.ratio * F.conv_transpose1d(
             hidden_states,
             self.filter.expand(num_channels, -1, -1),
