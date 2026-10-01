@@ -1,5 +1,9 @@
+import math
 import os
 import re
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -74,6 +78,75 @@ def get_source_tensor(source_name, weight_dict, lazy_load, lazy_load_file, use_i
         return weight_dict[source_name]
 
 
+_pin_slab_local = threading.local()
+
+
+class PinSlab:
+    """Bump allocator for long-lived page-locked host tensors.
+
+    torch.empty(pin_memory=True) goes through the caching host allocator: one hipHostMalloc per tensor, sized up
+    to a power of two, which pins page by page (~4-5 GB/s on gfx1201 hosts). The slab instead carves the tensors
+    out of large pageable chunks (the first-touch fill happens in the caller's copy_) and page-locks every chunk
+    once, with a single cudaHostRegister/hipHostRegister, when the scope closes (~30 GB/s for already-resident
+    pages). The bytes are identical; the memory is never returned (the tensors live for the whole process, like
+    the DiT offload weights they are meant for). If registration fails the tensors stay valid pageable memory.
+    """
+
+    def __init__(self, chunk_bytes=512 << 20, align=4096):
+        self.chunk_bytes = chunk_bytes
+        self.align = align
+        self.chunks = []
+        self.cur = None
+        self.off = 0
+        self.nbytes = 0
+
+    def alloc(self, shape, dtype):
+        nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        size = max(self.align, (nbytes + self.align - 1) // self.align * self.align)
+        if size > self.chunk_bytes // 4:
+            raw = torch.empty(size, dtype=torch.uint8)
+            self.chunks.append(raw)
+        else:
+            if self.cur is None or self.off + size > self.chunk_bytes:
+                self.cur = torch.empty(self.chunk_bytes, dtype=torch.uint8)
+                self.chunks.append(self.cur)
+                self.off = 0
+            raw = self.cur[self.off : self.off + size]
+            self.off += size
+        self.nbytes += nbytes
+        return raw[:nbytes].view(dtype).view(shape)
+
+    def register(self):
+        cudart = torch.cuda.cudart()
+        total, failed = 0, 0
+        for raw in self.chunks:
+            rc = cudart.cudaHostRegister(raw.data_ptr(), raw.numel(), 0)
+            if int(rc) != 0:
+                failed += 1
+            else:
+                total += raw.numel()
+        _PIN_SLAB_KEEP.extend(self.chunks)
+        self.chunks, self.cur = [], None
+        return total, failed
+
+
+_PIN_SLAB_KEEP = []
+
+
+@contextmanager
+def pin_slab_scope():
+    """Route create_pin_tensor() on the calling thread through a PinSlab; page-lock it on exit."""
+    slab = PinSlab()
+    _pin_slab_local.slab = slab
+    try:
+        yield slab
+    finally:
+        _pin_slab_local.slab = None
+        t = time.perf_counter()
+        total, failed = slab.register()
+        logger.info(f"pin slab: {slab.nbytes / 2**30:.2f} GiB of tensors in {total / 2**30:.2f} GiB registered in {time.perf_counter() - t:.3f}s (failed chunks: {failed})")
+
+
 def create_pin_tensor(tensor, transpose=False, dtype=None):
     """Create a tensor with pinned memory for faster data transfer to GPU.
 
@@ -87,6 +160,13 @@ def create_pin_tensor(tensor, transpose=False, dtype=None):
         Falls back to regular CPU tensor if pinned memory allocation fails.
     """
     dtype = dtype or tensor.dtype
+    slab = getattr(_pin_slab_local, "slab", None)
+    if slab is not None:
+        pin_tensor = slab.alloc(tensor.shape, dtype).copy_(tensor)
+        if transpose:
+            pin_tensor = pin_tensor.t()
+        del tensor
+        return pin_tensor
     try:
         pin_tensor = torch.empty(tensor.shape, pin_memory=True, dtype=dtype)
     except Exception as e:

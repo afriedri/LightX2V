@@ -66,6 +66,10 @@ _ASYNC_VAE_LOAD = os.environ.get("LIGHTX2V_H3_ASYNC_VAE_LOAD", "0") != "0"
 # image tile through the VAE encoder with MIOpen convs on that worker thread, absorbing the ~1.5 s one-time MIOpen
 # set-up of the first encode_condition() while the text encoder runs. Encode results are bitwise unchanged.
 _VAE_ENC_PREWARM = os.environ.get("LIGHTX2V_H3_VAE_ENC_PREWARM", "0") != "0"
+# LIGHTX2V_H3_DIT_PIN_SLAB=1 (default 0): allocate the DiT's pinned host (offload) weights from a few large pageable
+# chunks that are page-locked once at the end of the load (common/ops/utils.py PinSlab) instead of one
+# power-of-two-rounded hipHostMalloc per tensor. Same bytes; faster load, less contention with the text encoder.
+_DIT_PIN_SLAB = os.environ.get("LIGHTX2V_H3_DIT_PIN_SLAB", "0") != "0"
 _gc_time = {"start": 0.0, "total": 0.0, "count": 0, "full": 0, "full_time": 0.0}
 
 
@@ -292,6 +296,14 @@ class MiniMaxH3Runner(DefaultRunner):
     def init_scheduler(self):
         self.scheduler = MiniMaxH3Scheduler(self.config)
 
+    def _load_transformer_pinned(self):
+        if not _DIT_PIN_SLAB:
+            return self.load_transformer()
+        from lightx2v.common.ops.utils import pin_slab_scope
+
+        with pin_slab_scope():
+            return self.load_transformer()
+
     @ProfilingContext4DebugL2("Load models")
     def load_model(self):
         if self._is_mps_low_memory_streaming():
@@ -373,7 +385,7 @@ class MiniMaxH3Runner(DefaultRunner):
         self._audio_vae = value
 
     def _load_transformer_and_release_buffers(self):
-        model = self.load_transformer()
+        model = self._load_transformer_pinned()
         if self.config.get("dit_release_block_offload_buffers", False):
             model.release_block_offload_buffers()
         return model
