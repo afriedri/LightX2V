@@ -1,4 +1,6 @@
+import gc
 import os
+import time
 from contextlib import suppress
 
 import numpy as np
@@ -49,6 +51,53 @@ from lightx2v.utils.ltx2_media_io import encode_video
 from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
+
+# LIGHTX2V_H3_GC_FREEZE=1 (default 0): move every object that exists once the models are loaded (and again once the
+# background DiT load is joined) into the garbage collector's permanent generation (gc.freeze). The loaded models
+# create millions of long-lived Python objects, so every full gc.collect() (explicit ones on encoder/VAE offload and
+# the automatic generation-2 collections) re-traverses them: ~0.25 s each. Frozen objects are skipped. Model objects
+# are never freed during a run anyway, and objects freed by reference counting (all tensors) are unaffected.
+_GC_FREEZE = os.environ.get("LIGHTX2V_H3_GC_FREEZE", "0") != "0"
+# LIGHTX2V_H3_GC_STATS=1 (default 0): log the accumulated garbage-collection time (diagnostic only).
+_GC_STATS = os.environ.get("LIGHTX2V_H3_GC_STATS", "0") != "0"
+# LIGHTX2V_H3_ASYNC_VAE_LOAD=1 (default 0): load the VAEs on a worker thread, overlapped with the text encoder.
+_ASYNC_VAE_LOAD = os.environ.get("LIGHTX2V_H3_ASYNC_VAE_LOAD", "0") != "0"
+# LIGHTX2V_H3_VAE_ENC_PREWARM=1 (default 0; needs ASYNC_VAE_LOAD=1): after the background VAE load, push one dummy
+# image tile through the VAE encoder with MIOpen convs on that worker thread, absorbing the ~1.5 s one-time MIOpen
+# set-up of the first encode_condition() while the text encoder runs. Encode results are bitwise unchanged.
+_VAE_ENC_PREWARM = os.environ.get("LIGHTX2V_H3_VAE_ENC_PREWARM", "0") != "0"
+_gc_time = {"start": 0.0, "total": 0.0, "count": 0, "full": 0, "full_time": 0.0}
+
+
+def _gc_callback(phase, info):
+    if phase == "start":
+        _gc_time["start"] = time.perf_counter()
+        return
+    dt = time.perf_counter() - _gc_time["start"]
+    _gc_time["total"] += dt
+    _gc_time["count"] += 1
+    if info.get("generation") == 2:
+        _gc_time["full"] += 1
+        _gc_time["full_time"] += dt
+
+
+if _GC_STATS:
+    gc.callbacks.append(_gc_callback)
+
+
+def _gc_report(where):
+    if _GC_STATS:
+        logger.info(
+            f"MiniMax-H3 gc stats @{where}: {_gc_time['count']} collections {_gc_time['total']:.3f} s "
+            f"(full: {_gc_time['full']} / {_gc_time['full_time']:.3f} s), frozen objects {gc.get_freeze_count()}"
+        )
+
+
+def _gc_freeze(where):
+    if _GC_FREEZE:
+        gc.freeze()
+        logger.info(f"MiniMax-H3 gc.freeze @{where}: {gc.get_freeze_count()} objects frozen")
+
 
 class _PeerAudio:
     """Audio decoded on another rank: ``waveform`` receives it (first access) as the CPU [2, samples] tensor."""
@@ -160,6 +209,7 @@ class MiniMaxH3Runner(DefaultRunner):
         self._model_executor.shutdown(wait=False)
         self.model.set_scheduler(self.scheduler)
         self._finish_model_setup()
+        _gc_freeze("DiT load joined")
 
     @ProfilingContext4DebugL1("Warmup")
     def run_warmup(self):
@@ -233,6 +283,7 @@ class MiniMaxH3Runner(DefaultRunner):
         self.__dict__.pop("inputs", None)
 
     def end_run(self):
+        _gc_report("end of run")
         self.clear_conditioning_state()
         super().end_run()
 
@@ -259,7 +310,59 @@ class MiniMaxH3Runner(DefaultRunner):
         else:
             self.model = self.load_transformer()
         self.text_encoders = self.load_text_encoder()
-        self.video_vae, self.audio_vae = self.load_vae()
+        if _ASYNC_VAE_LOAD and torch.cuda.is_available():
+            # LIGHTX2V_H3_ASYNC_VAE_LOAD=1: read the video/audio VAE checkpoints on a worker thread while this thread
+            # runs the text encoder; the VAEs are joined on first access (video_vae / audio_vae properties). The
+            # parallel encode/decode setup issues collectives, so it runs at the join, on this thread.
+            from concurrent.futures import ThreadPoolExecutor
+
+            device = torch.cuda.current_device()
+
+            def load():
+                torch.cuda.set_device(device)
+                video_vae, audio_vae = self._load_vae_models()
+                if _VAE_ENC_PREWARM and os.environ.get("LIGHTX2V_H3_VAE_ENCODE_MIOPEN", "1") != "0":
+                    from lightx2v.models.video_encoders.hf.minimax_h3.video_vae import prewarm_encoder_miopen
+
+                    start = time.perf_counter()
+                    if prewarm_encoder_miopen(video_vae):
+                        logger.info(f"MiniMax-H3 VAE encoder MIOpen prewarm (background) {time.perf_counter() - start:.3f}s")
+                return video_vae, audio_vae
+
+            self._vae_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-vae-load")
+            self._vae_future = self._vae_executor.submit(load)
+        else:
+            self.video_vae, self.audio_vae = self.load_vae()
+        _gc_freeze("load_model")
+
+    def _ensure_vae(self):
+        future = self.__dict__.pop("_vae_future", None)
+        if future is None:
+            return
+        with ProfilingContext4DebugL2("Wait for VAE load"):
+            video_vae, audio_vae = future.result()
+        # Join the worker thread: its thread-local MIOpen handle (warmed by the encoder prewarm) is returned to
+        # PyTorch's handle pool when the thread exits, and is then picked up by this thread's first MIOpen call.
+        self._vae_executor.shutdown(wait=True)
+        self._video_vae, self._audio_vae = self._setup_vae_parallel(video_vae), audio_vae
+
+    @property
+    def video_vae(self):
+        self._ensure_vae()
+        return self.__dict__.get("_video_vae")
+
+    @video_vae.setter
+    def video_vae(self, value):
+        self._video_vae = value
+
+    @property
+    def audio_vae(self):
+        self._ensure_vae()
+        return self.__dict__.get("_audio_vae")
+
+    @audio_vae.setter
+    def audio_vae(self, value):
+        self._audio_vae = value
 
     def load_transformer(self):
         model_kwargs = {
@@ -314,6 +417,11 @@ class MiniMaxH3Runner(DefaultRunner):
                 raise ValueError(f"VAE decode tile shape for {resolution} must be larger than the tile overlap, got {tile_shape}")
 
     def load_vae(self):
+        video_vae, audio_vae = self._load_vae_models()
+        return self._setup_vae_parallel(video_vae), audio_vae
+
+    def _load_vae_models(self):
+        """Build both VAEs (no collectives; may run on a worker thread)."""
         cpu_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload", False))
         video_vae_quantized = self.config.get("video_vae_quantized", False)
         video_vae_quant_scheme = self.config["video_vae_quant_scheme"] if video_vae_quantized else None
@@ -332,6 +440,14 @@ class MiniMaxH3Runner(DefaultRunner):
         )
         self._vae_decode_tile_shapes = self.config.get("vae_decode_tile_shape", {})
         self._validate_vae_decode_tile_shapes(self._vae_decode_tile_shapes, video_vae)
+        audio_vae = MiniMaxH3AudioVAE.from_pretrained(self.config["model_path"], device=AI_DEVICE, cpu_offload=cpu_offload)
+        configured_sample_rate = int(self.config.get("audio_sampling_rate", audio_vae.sampling_rate))
+        if configured_sample_rate != audio_vae.sampling_rate:
+            raise ValueError(f"MiniMax-H3 audio_sampling_rate must match the Audio VAE checkpoint: config={configured_sample_rate}, checkpoint={audio_vae.sampling_rate}")
+        return video_vae, audio_vae
+
+    def _setup_vae_parallel(self, video_vae):
+        """Enable parallel VAE encode/decode (collectives: call on the main thread of every rank)."""
         if self.config.get("vae_encode_parallel", False):
             world_size = dist.get_world_size() if dist.is_initialized() else 1
             if world_size > 1:
@@ -346,11 +462,7 @@ class MiniMaxH3Runner(DefaultRunner):
                 logger.info(f"MiniMax-H3 VAE spatiotemporal tile parallelism enabled over {world_size} ranks")
             else:
                 logger.info("MiniMax-H3 VAE spatiotemporal tile parallelism disabled for single-rank inference")
-        audio_vae = MiniMaxH3AudioVAE.from_pretrained(self.config["model_path"], device=AI_DEVICE, cpu_offload=cpu_offload)
-        configured_sample_rate = int(self.config.get("audio_sampling_rate", audio_vae.sampling_rate))
-        if configured_sample_rate != audio_vae.sampling_rate:
-            raise ValueError(f"MiniMax-H3 audio_sampling_rate must match the Audio VAE checkpoint: config={configured_sample_rate}, checkpoint={audio_vae.sampling_rate}")
-        return video_vae, audio_vae
+        return video_vae
 
     def _resolve_request_geometry(self, geometry_image=None):
         if self.input_info.size:
@@ -588,6 +700,7 @@ class MiniMaxH3Runner(DefaultRunner):
         if task == "t2av" and not bool((tags == TEXT_TAG).all()):
             raise ValueError("MiniMax-H3 t2av conditioner returned non-text modality rows")
         self.maybe_empty_cache()
+        _gc_report("input encoder")
         return {"text_encoder_output": text_encoder_output}
 
     _run_input_encoder_local_t2av = _run_input_encoder_local_h3

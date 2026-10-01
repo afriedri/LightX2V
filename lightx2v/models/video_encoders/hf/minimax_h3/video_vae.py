@@ -1418,3 +1418,59 @@ class MiniMaxH3VideoVAE(nn.Module):
 
 # Explicit alias for callers that prefer the upstream autoencoder naming.
 AutoencoderKLMiniMaxH3Native = MiniMaxH3VideoVAE
+
+
+def prewarm_encoder_miopen(vae: MiniMaxH3VideoVAE) -> bool:
+    """Push one dummy image tile through encoder + quant_conv with MIOpen convolutions.
+
+    The first MIOpen-backed encode_condition() of a process pays ~1.5 s of one-time
+    solver/kernel set-up.  This runs that set-up on a background thread (e.g. while the
+    text encoder streams its weights).  It must not flip the process-global
+    torch.backends.cudnn flag (the main thread's Qwen-VL patch embed selects its exact
+    path on it), so the encoder's Conv3d modules are temporarily given instance-level
+    forwards that call aten::_convolution with cudnn_enabled=True directly; the shapes,
+    dtypes and conv parameters are identical to encode_condition's.  The output is
+    discarded and no module state changes, so later encodes are unaffected numerically.
+    """
+    if vae.execution_device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    patched = []
+
+    def miopen_forward(module):
+        causal = isinstance(module, MiniMaxH3VideoCausalConv3d)
+
+        def forward(hidden_states):
+            if causal:
+                if module.spatial_padding > 0:
+                    p = module.spatial_padding
+                    hidden_states = F.pad(hidden_states, (p, p, p, p, 0, 0), mode=module.spatial_padding_mode)
+                if module.temporal_padding > 0:
+                    hidden_states = F.pad(hidden_states, (0, 0, 0, 0, module.temporal_padding, 0))
+                padding, groups = [0, 0, 0], 1
+            else:
+                padding, groups = list(module.padding), module.groups
+            return torch.ops.aten._convolution(hidden_states, module.weight, module.bias, list(module.stride), padding,
+                                               list(module.dilation), False, [0, 0, 0], groups,
+                                               False, False, True, False)
+
+        return forward
+
+    modules = list(vae.encoder.modules()) + [vae.quant_conv]
+    try:
+        for module in modules:
+            if not isinstance(module, nn.Conv3d) or module.weight.dtype == torch.float8_e4m3fn:
+                continue
+            if not isinstance(module, MiniMaxH3VideoCausalConv3d) and (module.padding_mode != "zeros" or isinstance(module.padding, str)):
+                continue
+            module.forward = miopen_forward(module)
+            patched.append(module)
+        pixels = torch.zeros((1, 3, 1, vae.tile_sample_min_height, vae.tile_sample_min_width), device=vae.execution_device, dtype=vae.sensitive_layer_dtype)
+        if vae._use_channels_last_encoder_input:
+            pixels = pixels.contiguous(memory_format=torch.channels_last_3d)
+        with torch.no_grad():
+            vae.quant_conv(vae.encoder(pixels))
+        torch.cuda.current_stream().synchronize()
+    finally:
+        for module in patched:
+            del module.forward
+    return True
