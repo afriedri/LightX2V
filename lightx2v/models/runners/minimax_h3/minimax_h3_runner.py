@@ -1,5 +1,7 @@
 import gc
 import os
+import queue
+import threading
 import time
 from contextlib import suppress
 
@@ -48,7 +50,7 @@ from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import DTYPE_MAP, GET_RECORDER_MODE
 from lightx2v.utils.input_info import INPUT_INFO_TYPES
 from lightx2v.utils.ltx2_media_io import encode_video
-from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2
+from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2, no_sync_profiling
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
 
@@ -70,6 +72,11 @@ _VAE_ENC_PREWARM = os.environ.get("LIGHTX2V_H3_VAE_ENC_PREWARM", "0") != "0"
 # chunks that are page-locked once at the end of the load (common/ops/utils.py PinSlab) instead of one
 # power-of-two-rounded hipHostMalloc per tensor. Same bytes; faster load, less contention with the text encoder.
 _DIT_PIN_SLAB = os.environ.get("LIGHTX2V_H3_DIT_PIN_SLAB", "0") != "0"
+# LIGHTX2V_H3_VAE_STREAM_SAVE=1 (default 0): stream the video VAE decode into the mp4 encoder. The decode-parallel
+# ranks take alternating blocks of tiles and send each block to rank 0 as soon as it is decoded; rank 0 stitches
+# every temporal clip once its tiles are in and hands the uint8 frames to an encoder thread (libx264 + mux), so the
+# save overlaps the decode instead of following it. Frames are bitwise identical to decode() + the uint8 conversion.
+_STREAM_SAVE = os.environ.get("LIGHTX2V_H3_VAE_STREAM_SAVE", "0") != "0"
 _gc_time = {"start": 0.0, "total": 0.0, "count": 0, "full": 0, "full_time": 0.0}
 
 
@@ -121,6 +128,78 @@ class _PeerAudio:
             dist.recv(waveform, src=self.source)
             self._waveform = waveform[0].cpu()
         return self._waveform
+
+
+class _DeferredAudio:
+    """Audio handed to the stream encoder thread before the waveform exists (read only after the last video frame)."""
+
+    def __init__(self, sampling_rate):
+        self.sampling_rate = sampling_rate
+        self._ready = threading.Event()
+        self._waveform = None
+
+    def set(self, waveform):
+        self._waveform = waveform
+        self._ready.set()
+
+    @property
+    def waveform(self):
+        self._ready.wait()
+        if self._waveform is None:
+            raise RuntimeError("MiniMax-H3 stream save: audio unavailable")
+        return self._waveform
+
+
+class _StreamSaver:
+    """LIGHTX2V_H3_VAE_STREAM_SAVE: encoder thread fed with uint8 frame chunks while the video is still decoding."""
+
+    def __init__(self, output_path, fps, sampling_rate, codec_options):
+        self.queue = queue.Queue()
+        self.audio = _DeferredAudio(sampling_rate) if sampling_rate else None
+        self.output_path = output_path
+        self.errors = []
+        self.frames = 0
+        self.thread = threading.Thread(target=self._run, args=(fps, codec_options), name="h3-stream-save", daemon=True)
+        self.thread.start()
+
+    def _chunks(self):
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            frames, event = item
+            if event is not None:
+                event.synchronize()
+            self.frames += frames.shape[0]
+            yield frames
+
+    def _run(self, fps, codec_options):
+        # Lower this thread's CPU priority (Linux: per thread, inherited by the x264 worker threads it creates) so
+        # the encoder does not delay the kernel-launching / runtime threads of the ranks sharing these CPUs.
+        nice = int(os.environ.get("LIGHTX2V_H3_STREAM_SAVE_NICE", "10") or 0)
+        if nice > 0 and hasattr(os, "setpriority"):
+            with suppress(OSError):
+                os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), nice)
+        try:
+            encode_video(video=self._chunks(), fps=fps, audio=self.audio, output_path=self.output_path,
+                         video_chunks_number=1, video_codec_options=codec_options)
+        except BaseException as error:  # noqa: BLE001 - re-raised on the main thread in finish()
+            self.errors.append(error)
+            while self.queue.get() is not None:
+                pass
+
+    def put(self, item):
+        self.queue.put(item)
+
+    def close_video(self):
+        self.queue.put(None)
+
+    def finish(self, waveform):
+        if self.audio is not None:
+            self.audio.set(waveform)
+        self.thread.join()
+        if self.errors:
+            raise self.errors[0]
 
 
 torch_device_module = getattr(torch, AI_DEVICE)
@@ -838,8 +917,15 @@ class MiniMaxH3Runner(DefaultRunner):
         dump = os.environ.get("LIGHTX2V_H3_DUMP_LATENTS")
         if dump and (not dist.is_initialized() or dist.get_rank() == 0):
             torch.save({"video": video_latents.detach().cpu(), "audio": audio_latents.detach().cpu()}, dump)
-        with ProfilingContext4DebugL1("Run Video VAE Decoder"):
-            video = self.video_vae.decode(video_latents)
+        stream = self._stream_save_enabled()
+        # Streamed decode on a sending rank: its last isends are still waiting for rank 0 to post the recvs, and a
+        # profiler device-sync here would hold the audio decode back until rank 0 has decoded everything.
+        sender_no_sync = stream and dist.is_initialized() and dist.get_rank() != 0
+        with no_sync_profiling(sender_no_sync), ProfilingContext4DebugL1("Run Video VAE Decoder"):
+            if stream:
+                video = self._stream_decode_save(video_latents)
+            else:
+                video = self.video_vae.decode(video_latents)
         audio = None
         peer = self._audio_peer_rank()
         if peer is None:
@@ -849,7 +935,7 @@ class MiniMaxH3Runner(DefaultRunner):
         elif dist.get_rank() == peer:
             # The last rank is idle once its video tiles are sent: decode the audio there and ship the
             # waveform to rank 0, which only needs it after muxing every video frame (encode_video).
-            with ProfilingContext4DebugL1("Run Audio VAE Decoder"):
+            with no_sync_profiling(sender_no_sync), ProfilingContext4DebugL1("Run Audio VAE Decoder"):
                 waveform = self.audio_vae.decode(audio_latents).float().contiguous()
                 if waveform.device.type == "cpu":
                     waveform = waveform.to(AI_DEVICE)
@@ -861,6 +947,35 @@ class MiniMaxH3Runner(DefaultRunner):
         elif dist.get_rank() == 0:
             audio = _PeerAudio(peer)
         return video, audio
+
+    def _stream_save_enabled(self):
+        # Same decision on every rank (the tile-to-rank assignment of the streamed decode differs from decode()).
+        output_path = self.input_info.save_result_path
+        return (_STREAM_SAVE and not self.input_info.return_result_tensor and bool(output_path)
+                and os.path.splitext(output_path)[1].lower() == ".mp4")
+
+    def _stream_decode_save(self, video_latents):
+        """Decode with VAE.decode_stream_u8 and feed rank 0's encoder thread; returns the _StreamSaver (rank 0)."""
+        saver = None
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            output_path = self.input_info.save_result_path
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            logger.info(f"Saving MiniMax-H3 audio-video output to {output_path} (streamed with the VAE decode)")
+            saver = _StreamSaver(output_path, int(self.config.get("fps", 24)), self.audio_vae.sampling_rate,
+                                 self.config.get("video_codec_options"))
+        start = time.perf_counter()
+        first = None
+        try:
+            for item in self.video_vae.decode_stream_u8(video_latents):
+                if first is None:
+                    first = time.perf_counter() - start
+                saver.put(item)
+        finally:
+            if saver is not None:
+                saver.close_video()
+        if saver is not None:
+            logger.info(f"MiniMax-H3 stream decode: first frames enqueued after {first:.2f}s, decode loop {time.perf_counter() - start:.2f}s")
+        return saver
 
     def _audio_peer_rank(self):
         """LIGHTX2V_H3_AUDIO_PEER=1 (default): decode audio on the last rank, overlapped with rank 0's video save."""
@@ -878,6 +993,16 @@ class MiniMaxH3Runner(DefaultRunner):
 
     def process_images_after_vae_decoder(self):
         if self.video_vae.decode_parallel and dist.get_rank() != 0:
+            return {"video": None, "audio": None}
+        if isinstance(self.gen_video, _StreamSaver):
+            saver = self.gen_video
+            with ProfilingContext4DebugL2("Save Audio-Video Output"):
+                if isinstance(self.gen_audio, _PeerAudio):
+                    waveform = self.gen_audio.waveform
+                else:
+                    waveform = self.gen_audio[0].float().cpu()
+                saver.finish(waveform)
+            logger.info(f"MiniMax-H3 output saved to {saver.output_path} ({saver.frames} frames, streamed)")
             return {"video": None, "audio": None}
         if self.input_info.return_result_tensor:
             return {

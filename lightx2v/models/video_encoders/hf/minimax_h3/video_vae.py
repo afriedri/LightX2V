@@ -1415,6 +1415,215 @@ class MiniMaxH3VideoVAE(nn.Module):
             return_cpu=return_cpu,
         )
 
+    # ------------------------------------------------------------------------------------------------------------
+    # LIGHTX2V_H3_VAE_STREAM_SAVE=1 (runner): streamed decode. Same tiles, tile decoder, stitching, temporal blend,
+    # tail crop and postprocess as decode() followed by the runner's uint8 conversion (bitwise identical frames), but
+    # (a) with decode parallel the ranks take ALTERNATING blocks of tiles (default: half a temporal clip each,
+    #     LIGHTX2V_H3_VAE_STREAM_BLOCK) instead of one contiguous half each, every non-zero rank sends each block
+    #     to rank 0 as soon as it is decoded, and
+    # (b) rank 0 stitches every temporal clip as soon as its tiles are there and yields the finished frames as a
+    #     uint8 [F, H, W, 3] pinned CPU chunk (copied on a side stream), so the caller can encode the mp4 while the
+    #     rest of the video is still being decoded (and the full FP32 video is never materialized).
+    # ------------------------------------------------------------------------------------------------------------
+    def decode_stream_u8(self, latents: torch.Tensor, block_tiles: int | None = None):
+        """Generator over ``(frames_u8_cpu, ready_event)`` (rank 0; other ranks yield nothing).
+
+        ``frames_u8_cpu`` is pinned host memory filled asynchronously; wait on ``ready_event`` before reading it.
+        """
+        if latents.ndim != 5 or latents.shape[1] != self.post_quant_conv.in_channels:
+            raise ValueError(f"video latents must have shape [batch, {self.post_quant_conv.in_channels}, frames, height, width], got {tuple(latents.shape)}")
+        if latents.shape[0] != 1:
+            raise ValueError("decode_stream_u8 supports batch size 1")
+        device = self._activate()
+        try:
+            with torch.no_grad():
+                latents = latents.to(device=device, dtype=self.sensitive_layer_dtype)
+                latents = self.denormalize_latents(latents)
+                if self.sensitive_layer_dtype != self.infer_dtype:
+                    latents = latents.to(self.infer_dtype)
+            yield from self._decode_stream(latents, block_tiles)
+        finally:
+            if self.cpu_offload:
+                self.offload()
+
+    def _chunk_to_u8(self, chunk: torch.Tensor, side_stream):
+        with torch.no_grad():
+            video = chunk
+            if self.sensitive_layer_dtype != self.infer_dtype:
+                video = video.to(self.sensitive_layer_dtype)
+            video = self.postprocess(video).float()
+            frames = (video[0].permute(1, 2, 3, 0).float() * 255.0).round().to(torch.uint8).contiguous()
+        if frames.device.type == "cpu":
+            return frames, None
+        host = torch.empty(frames.shape, dtype=torch.uint8, pin_memory=True)
+        side_stream.wait_stream(torch.cuda.current_stream(frames.device))
+        with torch.cuda.stream(side_stream):
+            host.copy_(frames, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(side_stream)
+        frames.record_stream(side_stream)
+        return host, event
+
+    def _decode_stream(self, latents: torch.Tensor, block_tiles: int | None):
+        tokens_chunk_size = self.tokens_chunk_size
+        temporal_ratio = self.temporal_compression_ratio
+        chunk_num_frames = tokens_chunk_size * temporal_ratio
+
+        num_tokens = latents.shape[2] + self.token_drop
+        pad_tokens = (-num_tokens) % tokens_chunk_size
+        num_clips = (num_tokens + pad_tokens) // tokens_chunk_size - int(self.token_drop > 0)
+        if num_clips <= 0:
+            raise ValueError(f"Video latent sequence is too short for clip_length={self.clip_length}, token_drop={self.token_drop}: got {latents.shape[2]} frames")
+        pad_frames = 0
+        if pad_tokens > 0:
+            latents = torch.cat([latents, latents[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+            intra_tail = self.clip_length % temporal_ratio
+            num_tokens_before_pad = latents.shape[2] - pad_tokens
+            pad_frames = sum(intra_tail if intra_tail and (num_tokens_before_pad + offset) % tokens_chunk_size == 0 else temporal_ratio for offset in range(pad_tokens))
+
+        spatial_layout = self._spatial_tile_layout(latents)
+        tiles_per_clip = spatial_layout.num_tiles
+        all_tiles = self._get_all_tiles(latents, num_clips, spatial_layout)
+        num_tiles = len(all_tiles)
+
+        parallel = self.decode_parallel and dist.is_initialized() and dist.get_world_size() > 1
+        rank = dist.get_rank() if parallel else 0
+        world = dist.get_world_size() if parallel else 1
+        if block_tiles is None:
+            block_tiles = int(os.environ.get("LIGHTX2V_H3_VAE_STREAM_BLOCK", "0") or 0) or max(1, math.ceil(tiles_per_clip / world))
+        blocks = [list(range(start, min(start + block_tiles, num_tiles))) for start in range(0, num_tiles, block_tiles)]
+        owners = [index % world for index in range(len(blocks))]
+        # LIGHTX2V_H3_VAE_STREAM_SHIFT=N: the last N tiles of the last rank (which then decodes the audio) are decoded by
+        # rank 0 instead, so both ranks finish at about the same time.
+        shift = min(int(os.environ.get("LIGHTX2V_H3_VAE_STREAM_SHIFT", "0") or 0), num_tiles) if world > 1 else 0
+        while shift > 0:
+            last = max((index for index, owner in enumerate(owners) if owner == world - 1), default=None)
+            if last is None:
+                break
+            take = min(shift, len(blocks[last]))
+            moved = blocks[last][len(blocks[last]) - take:]
+            if take == len(blocks[last]):
+                owners[last] = 0
+            else:
+                blocks[last] = blocks[last][:len(blocks[last]) - take]
+                blocks.insert(last + 1, moved)
+                owners.insert(last + 1, 0)
+            shift -= take
+
+        def decode_block(block):
+            with torch.no_grad():
+                return self._decode_tiles([all_tiles[index] for index in block])
+
+        if rank != 0:
+            for old_requests, _ in getattr(self, "_stream_tail_sends", None) or []:
+                for request in old_requests:
+                    request.wait()
+            self._stream_tail_sends = None
+            in_flight = []
+            for block_index in (index for index, owner in enumerate(owners) if owner == rank):
+                decoded = decode_block(blocks[block_index])
+                payload = torch.stack(decoded).contiguous()
+                del decoded
+                requests = dist.batch_isend_irecv([dist.P2POp(dist.isend, payload, 0)])
+                in_flight.append((requests, payload))
+                # Keep at most two blocks in flight (bounded memory); waiting on an older send only orders the
+                # current stream after it, it does not block the host.
+                while len(in_flight) > 2:
+                    old_requests, _ = in_flight.pop(0)
+                    for request in old_requests:
+                        request.wait()
+            # Do not order this rank's compute stream after the last sends (they complete only when rank 0 gets to
+            # them): its next work (the audio decode) can start right away. The requests and payloads are kept alive
+            # until the next streamed decode.
+            self._stream_tail_sends = in_flight
+            return
+
+        done: dict[int, torch.Tensor] = {}
+        side_stream = torch.cuda.Stream(device=latents.device) if latents.is_cuda else None
+        state = {"next_clip": 0, "overlap": None, "emitted": 0, "limit": None}
+
+        def emit(chunk):
+            if state["limit"] is not None:
+                keep = state["limit"] - state["emitted"]
+                if keep <= 0:
+                    return None
+                if chunk.shape[2] > keep:
+                    chunk = chunk[:, :, :keep]
+            state["emitted"] += chunk.shape[2]
+            return self._chunk_to_u8(chunk, side_stream)
+
+        def ready_clips():
+            while state["next_clip"] < num_clips:
+                clip_index = state["next_clip"]
+                first = clip_index * tiles_per_clip
+                if any(first + offset not in done for offset in range(tiles_per_clip)):
+                    return
+                clip_tiles = [done.pop(first + offset) for offset in range(tiles_per_clip)]
+                with torch.no_grad():
+                    clip = self._stitch_clip(clip_tiles, spatial_layout.height_overlaps, spatial_layout.width_overlaps)
+                del clip_tiles
+                if state["limit"] is None:
+                    # every clip has the same frame count: total = num_clips * chunk(0) [+ trailing overlap chunk]
+                    frames = clip.shape[2]
+                    first_len = len(range(frames)[0:chunk_num_frames][self.frame_pre_padding:])
+                    tail_len = len(range(frames)[chunk_num_frames:2 * chunk_num_frames][self.frame_pre_padding:]) if self.token_drop > 0 else 0
+                    state["limit"] = num_clips * first_len + tail_len - pad_frames
+                for overlap_index in range(int(self.token_drop > 0) + 1):
+                    frame_start = overlap_index * chunk_num_frames
+                    chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
+                    chunk = chunk[:, :, self.frame_pre_padding :]
+                    if overlap_index == 0:
+                        if state["overlap"] is not None:
+                            with torch.no_grad():
+                                chunk = self._blend(state["overlap"], chunk, self.frame_overlap, dim=-3)
+                        out = emit(chunk)
+                        if out is not None:
+                            yield out
+                    else:
+                        state["overlap"] = chunk
+                state["next_clip"] += 1
+
+        pending = []
+        template = None
+        own = [index for index, owner in enumerate(owners) if owner == 0]
+        if not own:
+            raise RuntimeError("stream decode: rank 0 owns no tile block")
+        posted = 0  # peer blocks with an index below `posted` have their receive posted
+        for position, block_index in enumerate(own + [None]):
+            if block_index is not None:
+                for index, tile in zip(blocks[block_index], decode_block(blocks[block_index])):
+                    done[index] = tile
+                    template = tile
+            # Receives of the previous round: posted after this round's own decode was enqueued, so the NCCL
+            # receive kernels start when the peers are about done (no GPU time spent spinning).
+            for requests, buffer, block in pending:
+                for request in requests:
+                    request.wait()
+                for index, tile in zip(block, buffer):
+                    done[index] = tile
+            pending = []
+            yield from ready_clips()
+            if block_index is None:
+                break
+            # post the peers' blocks that precede rank 0's next own block (in block order: the peers send in order)
+            upto = own[position + 1] if position + 1 < len(own) else len(blocks)
+            for peer_block in range(posted, upto):
+                if owners[peer_block] == 0:
+                    continue
+                block = blocks[peer_block]
+                buffer = template.new_empty((len(block), *template.shape))
+                requests = dist.batch_isend_irecv([dist.P2POp(dist.irecv, buffer, owners[peer_block])])
+                pending.append((requests, buffer, block))
+            posted = max(posted, upto)
+        if state["next_clip"] != num_clips or done:
+            raise RuntimeError(f"stream decode incomplete: clip {state['next_clip']}/{num_clips}, {len(done)} tiles left")
+        if state["overlap"] is not None:
+            out = emit(state["overlap"])
+            if out is not None:
+                yield out
+        if state["emitted"] != state["limit"]:
+            raise RuntimeError(f"stream decode emitted {state['emitted']} frames, expected {state['limit']}")
+
 
 # Explicit alias for callers that prefer the upstream autoencoder naming.
 AutoencoderKLMiniMaxH3Native = MiniMaxH3VideoVAE
