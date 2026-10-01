@@ -8,6 +8,7 @@ from loguru import logger
 from safetensors import safe_open
 
 from lightx2v.common.ops.mm.fp8_f16_accum import fp8_f16_accum_mm_unavailable_reason
+from lightx2v.common.ops.utils import active_pin_slab
 from lightx2v.models.networks.base_model import BaseTransformerModel
 from lightx2v.models.networks.minimax_h3.adaln_cache import validate_adaln_cache_config
 from lightx2v.models.networks.minimax_h3.adaln_cache_guide import ADALN_CACHE_GUIDE
@@ -373,7 +374,13 @@ class MiniMaxH3Model(BaseTransformerModel):
             split_dim = 1
             if tensor.shape[split_dim] % self.tp_size:
                 raise ValueError(f"Cannot row-shard {key} shape {tuple(tensor.shape)} across TP size {self.tp_size}")
-            return torch.chunk(tensor, self.tp_size, dim=split_dim)[self.tp_rank].contiguous()
+            shard = torch.chunk(tensor, self.tp_size, dim=split_dim)[self.tp_rank]
+            slab = active_pin_slab() if shard.device.type == "cpu" else None
+            if slab is not None:
+                # LIGHTX2V_H3_DIT_PIN_SLAB: gather the strided shard straight into the pinned slab (create_pin_tensor
+                # then keeps it as is) instead of a temporary contiguous copy that is copied again.
+                return slab.alloc(shard.shape, shard.dtype).copy_(shard)
+            return shard.contiguous()
 
         if split_type == "ff_fused_col":
             if tensor.shape[0] % 2:
@@ -384,6 +391,10 @@ class MiniMaxH3Model(BaseTransformerModel):
             value, gate = tensor.split(half, dim=0)
             value = torch.chunk(value, self.tp_size, dim=0)[self.tp_rank]
             gate = torch.chunk(gate, self.tp_size, dim=0)[self.tp_rank]
+            slab = active_pin_slab() if value.device.type == "cpu" else None
+            if slab is not None:
+                out = slab.alloc((value.shape[0] + gate.shape[0], *value.shape[1:]), value.dtype)
+                return torch.cat((value, gate), dim=0, out=out)
             return torch.cat((value, gate), dim=0).contiguous()
 
         if tensor.shape[0] % self.tp_size:
