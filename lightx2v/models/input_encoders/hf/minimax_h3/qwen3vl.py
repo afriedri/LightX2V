@@ -1000,6 +1000,59 @@ class MiniMaxH3Qwen3VLTextEncoder:
     def unload_processor(self):
         self.processor = None
 
+    @staticmethod
+    def _start_anon_host_copy(backbone):
+        """LIGHTX2V_H3_TE_ANON_HOST=1: copy the pageable (checkpoint-mmap-backed) host weights into anonymous memory.
+
+        The first host-to-device copy from a pageable buffer pins its pages on the fly, which is ~5x slower for
+        file-backed checkpoint pages (~5 GB/s) than for anonymous memory. The clones are made on a small thread pool
+        in the background (the load continues with the vision tower / VAEs) and are joined before the first forward.
+        Values are unchanged (plain copies), so the text-encoder output is bitwise identical.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        jobs, seen = [], set()
+
+        def collect(obj, depth):
+            for key, value in list(vars(obj).items()):
+                if isinstance(value, torch.Tensor):
+                    if value.device.type == "cpu" and not value.is_pinned():
+                        jobs.append((obj, key, value))
+                elif depth < 2 and hasattr(value, "__dict__") and not isinstance(value, (type, torch.nn.Module)) and id(value) not in seen:
+                    seen.add(id(value))
+                    collect(value, depth + 1)
+
+        for _, module in backbone.named_weight_modules():
+            if id(module) not in seen:
+                seen.add(id(module))
+                collect(module, 0)
+
+        def run():
+            clones = {}
+
+            def clone(tensor):
+                return tensor.clone()
+
+            unique = {id(tensor): tensor for _, _, tensor in jobs}
+            with ThreadPoolExecutor(max_workers=int(os.environ.get("LIGHTX2V_H3_TE_ANON_HOST_THREADS", "8")), thread_name_prefix="h3-te-anon") as pool:
+                for key, cloned in zip(unique.keys(), pool.map(clone, unique.values())):
+                    clones[key] = cloned
+            for obj, key, tensor in jobs:
+                setattr(obj, key, clones[id(tensor)])
+            return sum(t.numel() * t.element_size() for t in clones.values())
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-te-anon-main")
+        future = executor.submit(run)
+        executor.shutdown(wait=False)
+        return future
+
+    def _join_anon_host_copy(self):
+        future = getattr(self, "_anon_host_future", None)
+        if future is not None:
+            nbytes = future.result()
+            self._anon_host_future = None
+            logger.info("MiniMax-H3 text encoder: {:.2f} GiB of pageable host weights copied to anonymous memory", nbytes / 2**30)
+
     def load_text_encoder(self):
         """Stream the native embedding and first 50 decoder layers."""
         if self.text_encoder is not None:
@@ -1036,6 +1089,8 @@ class MiniMaxH3Qwen3VLTextEncoder:
             self._load_quantized_weights(text_encoder, checkpoint_path)
         else:
             self._load_native_weights(text_encoder, checkpoint_path, text_config)
+            if os.environ.get("LIGHTX2V_H3_TE_ANON_HOST", "0") != "0" and not self.config.get("text_encoder_host_pinned", True):
+                self._anon_host_future = self._start_anon_host_copy(text_encoder)
         if self.block_offload:
             text_encoder.init_block_offload()
         elif not self.cpu_offload:
@@ -1244,6 +1299,7 @@ class MiniMaxH3Qwen3VLTextEncoder:
     def infer(self, prompt, image_list=None, references=None):
         """Return unbatched ``[tokens, 5120]`` conditioning and text tags."""
         self._ensure_loaded()
+        self._join_anon_host_copy()
         try:
             # Input encoding happens before DefaultRunner enters its main-model
             # try/finally.  Keep migration here so a partially failed transfer
