@@ -99,6 +99,10 @@ class PinSlab:
         self.cur = None
         self.off = 0
         self.nbytes = 0
+        self._ptrs = set()
+
+    def owns(self, tensor):
+        return tensor.device.type == "cpu" and tensor.untyped_storage().data_ptr() in self._ptrs
 
     def alloc(self, shape, dtype):
         nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
@@ -106,10 +110,12 @@ class PinSlab:
         if size > self.chunk_bytes // 4:
             raw = torch.empty(size, dtype=torch.uint8)
             self.chunks.append(raw)
+            self._ptrs.add(raw.untyped_storage().data_ptr())
         else:
             if self.cur is None or self.off + size > self.chunk_bytes:
                 self.cur = torch.empty(self.chunk_bytes, dtype=torch.uint8)
                 self.chunks.append(self.cur)
+                self._ptrs.add(self.cur.untyped_storage().data_ptr())
                 self.off = 0
             raw = self.cur[self.off : self.off + size]
             self.off += size
@@ -131,6 +137,11 @@ class PinSlab:
 
 
 _PIN_SLAB_KEEP = []
+
+
+def active_pin_slab():
+    """The PinSlab of the calling thread's pin_slab_scope(), or None."""
+    return getattr(_pin_slab_local, "slab", None)
 
 
 @contextmanager
@@ -162,7 +173,11 @@ def create_pin_tensor(tensor, transpose=False, dtype=None):
     dtype = dtype or tensor.dtype
     slab = getattr(_pin_slab_local, "slab", None)
     if slab is not None:
-        pin_tensor = slab.alloc(tensor.shape, dtype).copy_(tensor)
+        if slab.owns(tensor) and tensor.dtype == dtype and tensor.is_contiguous():
+            # Already materialized in the slab by the checkpoint loader (TP shard): no second copy.
+            pin_tensor = tensor
+        else:
+            pin_tensor = slab.alloc(tensor.shape, dtype).copy_(tensor)
         if transpose:
             pin_tensor = pin_tensor.t()
         del tensor
