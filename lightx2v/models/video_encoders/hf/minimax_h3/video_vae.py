@@ -1237,9 +1237,33 @@ class MiniMaxH3VideoVAE(nn.Module):
         local_start = sum(task_counts[:rank])
         local_end = local_start + task_counts[rank]
         local_tiles = all_tiles[local_start:local_end]
-        local_tiles = [self.decoder(self.post_quant_conv(tile)) for tile in local_tiles]
+        local_tiles = self._decode_tiles(local_tiles)
 
         return self._gather_tiles(local_tiles, task_counts)
+
+    def _decode_tiles(self, tiles: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Decode latent tiles one by one, or (LIGHTX2V_H3_VAE_DEC_BATCH=N > 1) N equally shaped tiles per decoder call.
+
+        Batching only raises the GEMM M dimension of the ViT decoder (each tile still attends only to itself); the
+        1x1 post-quant conv still runs per tile. With the fused ViT block (FFN-up GEMM per tile, see fused_vit_ops)
+        the result is bitwise identical to per-tile decoding.
+        """
+        batch = int(os.environ.get("LIGHTX2V_H3_VAE_DEC_BATCH", "0") or 0)
+        if batch <= 1:
+            return [self.decoder(self.post_quant_conv(tile)) for tile in tiles]
+        decoded = []
+        index = 0
+        while index < len(tiles):
+            group = [tiles[index]]
+            while len(group) < batch and index + len(group) < len(tiles) and tiles[index + len(group)].shape == group[0].shape:
+                group.append(tiles[index + len(group)])
+            index += len(group)
+            if len(group) == 1:
+                decoded.append(self.decoder(self.post_quant_conv(group[0])))
+                continue
+            stacked = torch.cat([self.post_quant_conv(tile) for tile in group], dim=0)
+            decoded.extend(self.decoder(stacked).split(1, dim=0))
+        return decoded
 
     def _decode(self, latents: torch.Tensor) -> torch.Tensor | None:
         """Decode tiled latents and assemble the full video on rank 0.
@@ -1281,7 +1305,7 @@ class MiniMaxH3VideoVAE(nn.Module):
             clip_end = clip_start + tiles_per_clip
             clip_tiles = all_tiles[clip_start:clip_end]
             if not self.decode_parallel:
-                clip_tiles = [self.decoder(self.post_quant_conv(tile)) for tile in clip_tiles]
+                clip_tiles = self._decode_tiles(clip_tiles)
 
             clip = self._stitch_clip(
                 clip_tiles,
